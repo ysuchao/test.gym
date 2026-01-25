@@ -38,7 +38,7 @@ def run_onnx_model(model_path, num_episodes=10):
 
             # Run inference
             outputs = session.run(None, {input_name: input_data})
-            action = np.argmax(outputs[0])
+            action = np.argmax(outputs[-1])
 
             # Step environment
             state, reward, terminated, truncated, _ = env.step(action)
