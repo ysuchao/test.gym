@@ -13,7 +13,7 @@ from rich import print
 GAMMA = 0.99
 LEARNING_RATE = 1e-3
 TRAIN_EPISODES = 5000
-GRADIENT_CLIP = 0.1
+GRADIENT_CLIP = 0.5
 VALUE_LOSS_COEF = 0.5
 ADV_NORM_EPS = 1e-8
 ENTROPY_BETA_START = 0.05
@@ -171,6 +171,7 @@ def train(episodes=TRAIN_EPISODES):
         state, _ = env.reset()
         state = normalize_state(state)
         total_reward = 0.0
+        total_shaped = 0.0
         steps = 0
         done = False
 
@@ -179,8 +180,8 @@ def train(episodes=TRAIN_EPISODES):
             next_state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             shaped_reward = float(reward)
-            # shaped_reward += np.sum(np.cos(np.clip(next_state, -np.pi, np.pi))) * 0.25
             next_state_norm = normalize_state(next_state)
+            shaped_reward += (np.sum(np.cos(np.clip(next_state_norm, -1, 1) * 0.5 * np.pi)) - 2) * 0.1 * int(steps > 10)
 
             agent.store_transition(
                 log_prob,
@@ -196,6 +197,7 @@ def train(episodes=TRAIN_EPISODES):
 
             state = next_state_norm
             total_reward += float(reward)
+            total_shaped += shaped_reward
             steps += 1
 
         if episode >= ENTROPY_WARMUP_EPISODES:
@@ -212,8 +214,9 @@ def train(episodes=TRAIN_EPISODES):
         ts = time.strftime('%H:%M:%S', time.localtime(now)) + f".{int((now % 1) * 1000):03d}"
         print(ts, end='\t')
         print(f"episode={episode}", end='\t')
-        print(f"reward={total_reward:.1f}", end='\t')
-        print(f"mean_score={mean_score:.1f}", end='\t')
+        print(f"reward={total_reward:.3f}", end='\t')
+        print(f"shaped={total_shaped:.3f}", end='\t')
+        print(f"mean_score={mean_score:.3f}", end='\t')
         print(f"lr={lr:.6f}", end='\t')
         print(f"entropy_beta={entropy_beta:.6f}", end='\t')
         print()

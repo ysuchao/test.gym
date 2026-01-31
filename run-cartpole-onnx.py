@@ -42,6 +42,7 @@ def run_onnx_model(model_path, num_episodes=10):
 
             # Step environment
             state, reward, terminated, truncated, _ = env.step(action)
+            # print(state)
             done = terminated or truncated
             total_reward += reward
         print(f"test.episode={i}, reward={total_reward}")
