@@ -1,0 +1,72 @@
+import sys
+import ale_py
+import gymnasium as gym
+import numpy as np
+import onnxruntime as ort
+
+
+STACK_FRAMES = 1
+gym.register_envs(ale_py)
+
+
+def normalize_state(state: np.ndarray) -> np.ndarray:
+    return (state.astype(np.float32) / 127.5) - 1.0
+
+
+def run_onnx_model(
+    model_path: str,
+    num_episodes: int = 5,
+    full_action_space: bool = True,
+    frameskip: int = 4,
+    render: bool = True,
+) -> None:
+    session = ort.InferenceSession(model_path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    input_name = next(iter(session.get_inputs())).name
+    output_names = [o.name for o in session.get_outputs()]
+
+    env = gym.make(
+        "ALE/MarioBros-v5",
+        full_action_space=full_action_space,
+        obs_type="grayscale",
+        frameskip=frameskip,
+        render_mode="human" if render else None,
+    )
+
+    for i in range(num_episodes):
+        state_raw, _ = env.reset()
+        state = normalize_state(np.asarray(state_raw))
+        stack: list[np.ndarray] = [state for _ in range(STACK_FRAMES)]
+        total_reward = 0.0
+        done = False
+        step_count = 0
+        while not done:
+            input_data = np.expand_dims(np.stack(stack, axis=0).astype(np.float32), axis=0)
+            results = session.run(output_names, {input_name: input_data})
+            # results[1] 是 action_logits
+            logits = np.squeeze(np.asarray(results[1]), axis=0)
+            probs = np.exp(logits - np.max(logits))
+            probs = probs / np.sum(probs)
+            # action = np.random.choice(len(probs), p=probs)
+            action = np.argmax(probs)  # 使用概率最高的 action
+
+            # 打印每种 action 的概率
+            action_probs_str = " | ".join([f"A{i}:{p:.3f}" for i, p in enumerate(probs)])
+            print(f"step={step_count:4d} | {action_probs_str} | chose=A{action}")
+
+            state_raw, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            total_reward += float(reward)
+            state = normalize_state(np.asarray(state_raw))
+            stack.pop(0)
+            stack.append(state)
+            step_count += 1
+        print(f"test.episode={i}, reward={total_reward:.3f}, steps={step_count}")
+    env.close()
+
+
+if __name__ == "__main__":
+    model_file = sys.argv[1] if len(sys.argv) > 1 else "mario-a2c-1.onnx"
+    try:
+        run_onnx_model(model_file)
+    except Exception as e:
+        print(f"error: {e}")
