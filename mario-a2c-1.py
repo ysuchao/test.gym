@@ -33,7 +33,7 @@ BATCH_SIZE = 512
 RND_OUTPUT_DIM = 128       # RND 嵌入维度（target/predictor 的输出大小）
 RND_LEARNING_RATE = 1e-4   # predictor 的学习率（比主网络低，避免学太快失去好奇心）
 RND_COEF = 1.0             # intrinsic reward 的混合系数
-GAMMA_INT = 0.99           # intrinsic reward 的折扣因子（比 extrinsic 短视，鼓励近期探索）
+GAMMA_INT = 0.99           # intrinsic reward 的折扣因子（当前与 GAMMA 相同；如需更短视的探索可调低至 0.95）
 
 gym.register_envs(ale_py)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -115,9 +115,9 @@ class RunningMeanStd:
         self.var = m2 / total_count
         self.count = total_count
 
-    def normalize(self, x):
-        """归一化：(x - mean) / std"""
-        return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
+    # 注意：归一化 intrinsic reward 时，只除以 std，不减 mean
+    # 原因：RND paper 中 intrinsic reward 始终为正（MSE），减去 mean 会产生负 reward
+    # 实际归一化在训练循环中直接做：reward_int_raw / (sqrt(var) + eps)
 
 
 class EntropyScheduler:
@@ -434,8 +434,13 @@ class Agent:
         # 需要重新前向计算 intrinsic_values（因为需要梯度）
         # 用存储的当前状态 s_t 来计算 V_int(s_t)
         states = torch.stack(self.states)  # [B, FRAME_STACK, H, W]
+        # .detach() 防止梯度通过 feature_net 传播第二次
+        # 没有 detach 的话，loss.backward() 会经过 feature_net 两条路径：
+        #   1) actor/critic 的正常前向 → 正确的梯度
+        #   2) 这里的 intrinsic value 重计算 → 额外的、不一致的梯度
+        # detach 后，只训练 intrinsic_value_net 的权重，feature_net 只接收来自 actor/critic 的梯度
         intrinsic_values_recomputed = self.intrinsic_value_net(
-            self.model.feature_net(states)
+            self.model.feature_net(states).detach()
         ).squeeze(-1)
         critic_loss_int = torch.nn.functional.mse_loss(intrinsic_values_recomputed, targets_int)
 
@@ -445,14 +450,20 @@ class Agent:
 
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(self.model.parameters()) + list(self.intrinsic_value_net.parameters()),
-            GRADIENT_CLIP,
-        )
+        # clip 前计算梯度范数，用于监控梯度健康度（爆炸/消失）
+        all_params = list(self.model.parameters()) + list(self.intrinsic_value_net.parameters())
+        grad_norm = torch.nn.utils.clip_grad_norm_(all_params, GRADIENT_CLIP)
         self.optimizer.step()
 
         self.clear_memory()
-        return rnd_loss.item()  # 返回 RND loss 用于监控
+        # 返回各项 loss 和梯度范数，用于训练监控
+        return {
+            "rnd_loss": rnd_loss.item(),
+            "actor_loss": actor_loss.item(),
+            "critic_loss_ext": critic_loss_ext.item(),
+            "critic_loss_int": critic_loss_int.item(),
+            "grad_norm": grad_norm.item(),
+        }
 
     def clear_memory(self):
         self.log_probs = []
@@ -496,8 +507,9 @@ def train(episodes: int = TRAIN_EPISODES, max_steps: int = 4096):
         steps = 0
         done = False
         total_entropy = 0.0
-        rnd_loss_accum = 0.0
-        rnd_loss_count = 0
+        # 训练指标累积器（每个 episode 内可能有多次 update_batch）
+        metrics_accum = {"rnd_loss": 0.0, "actor_loss": 0.0, "critic_loss_ext": 0.0, "critic_loss_int": 0.0, "grad_norm": 0.0}
+        metrics_count = 0
 
         while not done:
             action, log_prob, value, intrinsic_value, entropy = agent.select_action(state)
@@ -531,8 +543,9 @@ def train(episodes: int = TRAIN_EPISODES, max_steps: int = 4096):
                     intrinsic_reward_batch = []
                 rnd_loss = agent.update_batch()
                 if rnd_loss is not None:
-                    rnd_loss_accum += rnd_loss
-                    rnd_loss_count += 1
+                    for k in metrics_accum:
+                        metrics_accum[k] += rnd_loss[k]
+                    metrics_count += 1
 
             state = next_state
             total_reward_ext += reward_ext
@@ -547,15 +560,18 @@ def train(episodes: int = TRAIN_EPISODES, max_steps: int = 4096):
                 intrinsic_reward_batch = []
             rnd_loss = agent.update_batch()
             if rnd_loss is not None:
-                rnd_loss_accum += rnd_loss
-                rnd_loss_count += 1
+                for k in metrics_accum:
+                    metrics_accum[k] += rnd_loss[k]
+                metrics_count += 1
         agent.entropy_scheduler.step()
         lr = agent.step_scheduler()
 
         hist_rewards.append(total_reward_ext)
         mean_reward = sum(hist_rewards) / len(hist_rewards)
         entropy_beta = agent.entropy_scheduler.get_beta()
-        avg_rnd_loss = rnd_loss_accum / max(rnd_loss_count, 1)
+        # 计算各项 loss 的 episode 平均值
+        n = max(metrics_count, 1)
+        avg = {k: v / n for k, v in metrics_accum.items()}
         now = time.time()
         ts = time.strftime("%H:%M:%S", time.localtime(now)) + f".{int((now % 1) * 1000):03d}"
         print(ts, end="\t")
@@ -563,8 +579,13 @@ def train(episodes: int = TRAIN_EPISODES, max_steps: int = 4096):
         print(f"reward_ext={total_reward_ext:+.3f}", end="\t")
         print(f"reward_int={total_reward_int:+.3f}", end="\t")
         print(f"reward.mean={mean_reward:+.3f}", end="\t")
-        print(f"entropy.mean={total_entropy / steps:.3f}", end="\t")
-        print(f"rnd_loss={avg_rnd_loss:.6f}", end="\t")
+        print(f"entropy={total_entropy / steps:.3f}", end="\t")
+        print(f"actor={avg['actor_loss']:.4f}", end="\t")
+        print(f"c_ext={avg['critic_loss_ext']:.4f}", end="\t")
+        print(f"c_int={avg['critic_loss_int']:.4f}", end="\t")
+        print(f"rnd={avg['rnd_loss']:.6f}", end="\t")
+        print(f"grad={avg['grad_norm']:.4f}", end="\t")
+        print(f"rnd_std={np.sqrt(agent.rnd_reward_rms.var):.4f}", end="\t")
         print(f"steps={steps}", end="\t")
         print(f"lr={lr:.6f}", end="\t")
         print(f"beta={entropy_beta:.6f}", end="\t")
