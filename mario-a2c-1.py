@@ -10,6 +10,8 @@ from rich import print
 
 # Hyperparameters
 GAMMA = 0.99
+GAE_LAMBDA = 0.95
+FRAME_STACK = 4
 LEARNING_RATE = 5e-4
 TRAIN_EPISODES = 3000
 GRADIENT_CLIP = 1.0
@@ -26,6 +28,25 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def normalize_state(state):
     return (state.astype(np.float32) / 127.5) - 1.0
+
+
+class FrameStacker:
+    """堆叠连续帧以捕获时序信息（运动方向、速度等）"""
+
+    def __init__(self, k: int = FRAME_STACK):
+        self.k = k
+        self.frames = deque(maxlen=k)
+
+    def reset(self, frame):
+        """重置时用同一帧填充"""
+        for _ in range(self.k):
+            self.frames.append(frame)
+        return np.stack(self.frames, axis=0)  # [k, H, W]
+
+    def step(self, frame):
+        """添加新帧，返回堆叠结果"""
+        self.frames.append(frame)
+        return np.stack(self.frames, axis=0)  # [k, H, W]
 
 
 class EntropyScheduler:
@@ -45,9 +66,11 @@ class EntropyScheduler:
 class ActorCriticNet(torch.nn.Module):
     def __init__(self, state_shape, action_dim):
         super(ActorCriticNet, self).__init__()
+        # 输入通道数现在是 FRAME_STACK (4) 而不是 1
+        in_channels = FRAME_STACK
         self.conv_net = torch.nn.Sequential(
-            # Input: 1×210×160
-            torch.nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
+            # Input: 4×210×160 (堆叠4帧)
+            torch.nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
             torch.nn.ReLU(),
             # 32×210×160
             torch.nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
@@ -106,7 +129,8 @@ class Agent:
         self.terminateds = []
 
     def select_action(self, state):
-        state_t = torch.FloatTensor(state).to(device).unsqueeze(0).unsqueeze(0)
+        # state 已经是 [FRAME_STACK, H, W] 的堆叠帧
+        state_t = torch.FloatTensor(state).to(device).unsqueeze(0)  # [1, FRAME_STACK, H, W]
         # print(f"state_t.shape={state_t.shape}")
         value, logits = self.model(state_t)
         dist = torch.distributions.Categorical(logits=logits)
@@ -129,41 +153,39 @@ class Agent:
         values = torch.cat(self.values).squeeze(-1)  # [B]
         entropies = torch.cat(self.entropies)  # [B]
         rewards = torch.cat(self.rewards).squeeze(-1)  # [B]
-        next_states = torch.stack(self.next_states).unsqueeze(1)  # [B, state_dim]
+        next_states = torch.stack(self.next_states)  # [B, FRAME_STACK, H, W]
         terminateds = torch.cat(self.terminateds).squeeze(-1)  # [B] (1.0 if terminated else 0.0)
 
         with torch.no_grad():
-            # print(f"next_states.shape={next_states.shape}")
             next_values, _ = self.model(next_states)
             next_values = next_values.squeeze(-1)  # [B]
-            targets = rewards + GAMMA * next_values * (1.0 - terminateds)
 
-        advantages = targets - values
-        # print(f"advantages={advantages.cpu().numpy()}", end="\t")
+            # GAE (Generalized Advantage Estimation) 计算
+            # 比 1-step TD 有更低的方差，更稳定的训练
+            advantages = torch.zeros_like(rewards)
+            gae = 0.0
+            for t in reversed(range(len(rewards))):
+                # delta = r_t + γ * V(s_{t+1}) * (1 - done) - V(s_t)
+                delta = rewards[t] + GAMMA * next_values[t] * (1.0 - terminateds[t]) - values[t].detach()
+                # GAE: A_t = δ_t + (γλ) * (1 - done) * A_{t+1}
+                gae = delta + GAMMA * GAE_LAMBDA * (1.0 - terminateds[t]) * gae
+                advantages[t] = gae
+
+            # targets for value function: V_target = A + V
+            targets = advantages + values.detach()
+
         adv_detached = advantages.detach()
         adv_norm = (adv_detached - adv_detached.mean()) / (adv_detached.std(unbiased=False) + ADV_NORM_EPS)
 
         entropy_beta = self.entropy_scheduler.get_beta()
-        critic_loss = torch.nn.functional.mse_loss(values, targets.detach())
-        # log_probs_cpu = log_probs.cpu().detach()
-        # adv_norm_cpu = adv_norm.cpu().detach()
-        # print(f"log_probs={log_probs_cpu.numpy()}", end="\t")
-        # print(f"adv_norm={adv_norm_cpu.numpy()}", end="\t")
+        critic_loss = torch.nn.functional.mse_loss(values, targets)
         actor_loss = -(log_probs * adv_norm).mean()
         entropy_loss = -entropies.mean() * entropy_beta
-        # print(f"actor_loss={actor_loss.item():.3f}", end="\t")
-        # print(f"critic_loss={critic_loss.item():.3f}", end="\t")
-        # print(f"entropy_loss={entropy_loss.item():.3f}", end="\t")
-        # print(f"beta={entropy_beta:.6f}", end="\t")
         loss = actor_loss + VALUE_LOSS_COEF * critic_loss + entropy_loss
-        # loss_cpu = loss.cpu().detach()
-        # print(f"total_loss={loss_cpu.numpy():.3f}", end="\t")
-        # print()
 
         self.optimizer.zero_grad()
         loss.backward()
-        total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRADIENT_CLIP)
-        # print(f"total_norm={total_norm}")
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRADIENT_CLIP)
         self.optimizer.step()
 
         self.clear_memory()
@@ -194,10 +216,11 @@ def train(episodes: int = TRAIN_EPISODES, max_steps: int = 4096):
     print(f"env.observation_space.shape={env.observation_space.shape}")
     agent = Agent(env.observation_space.shape, int(env.action_space.n))
     hist_rewards = deque(maxlen=100)
+    frame_stacker = FrameStacker(FRAME_STACK)
 
     for episode in range(episodes):
-        state, _ = env.reset()
-        state = normalize_state(state)
+        raw_state, _ = env.reset()
+        state = frame_stacker.reset(normalize_state(raw_state))  # [FRAME_STACK, H, W]
         total_reward = 0.0
         steps = 0
         done = False
@@ -205,21 +228,21 @@ def train(episodes: int = TRAIN_EPISODES, max_steps: int = 4096):
 
         while not done:
             action, log_prob, value, entropy = agent.select_action(state)
-            next_state, reward, terminated, truncated, _ = env.step(action)
-            next_state_norm = normalize_state(next_state)
+            next_raw_state, reward, terminated, truncated, _ = env.step(action)
+            next_state = frame_stacker.step(normalize_state(next_raw_state))  # [FRAME_STACK, H, W]
             reward /= 800.0
             agent.store_transition(
                 log_prob,
                 value,
                 reward,
                 entropy,
-                next_state_norm,
+                next_state,
                 bool(terminated),
             )
             if len(agent.rewards) >= BATCH_SIZE:
                 agent.update_batch()
 
-            state = next_state_norm
+            state = next_state
             total_reward += reward
             total_entropy += float(entropy.item())
             steps += 1
@@ -257,24 +280,24 @@ def test(policy_net, episodes: int = 1):
         frameskip=4,
         render_mode="human",
     )
+    frame_stacker = FrameStacker(FRAME_STACK)
 
     for i in range(episodes):
-        state, _ = env.reset()
+        raw_state, _ = env.reset()
+        state = frame_stacker.reset(normalize_state(raw_state))
         total_reward = 0.0
         total_steps = 0
         done = False
         while not done:
-            state = normalize_state(state)
             with torch.no_grad():
-                state = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(device)
-                # print(f"state.shape={state.shape}")
-                _, logits = policy_net(state)
-                # assert False, logits
+                state_t = torch.FloatTensor(state).unsqueeze(0).to(device)  # [1, FRAME_STACK, H, W]
+                _, logits = policy_net(state_t)
                 logits = np.squeeze(logits.cpu().numpy(), axis=0)
                 probs = np.exp(logits - np.max(logits))
                 probs = probs / np.sum(probs)
                 action = np.random.choice(len(probs), p=probs)
-            state, reward, terminated, truncated, _ = env.step(action)
+            next_raw_state, reward, terminated, truncated, _ = env.step(action)
+            state = frame_stacker.step(normalize_state(next_raw_state))
             done = terminated or truncated
             total_reward += float(reward)
             total_steps += 1
@@ -284,7 +307,7 @@ def test(policy_net, episodes: int = 1):
 
 def export_onnx(policy_net, filename="mario-a2c-1.onnx"):
     policy_net.eval()
-    dummy_input = torch.randn(1, 1, 210, 160).to(device)
+    dummy_input = torch.randn(1, FRAME_STACK, 210, 160).to(device)  # [1, FRAME_STACK, H, W]
     torch.onnx.export(
         policy_net,
         (dummy_input,),
