@@ -71,23 +71,20 @@ class ActorCriticNet(torch.nn.Module):
         # 输入通道数现在是 FRAME_STACK (4) 而不是 1
         in_channels = FRAME_STACK
         self.conv_net = torch.nn.Sequential(
-            # Input: 4×84×84 (堆叠4帧, 下采样后)
-            torch.nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
+            # Nature DQN 标准架构 (DeepMind 2015)
+            # Input: 4×84×84
+            torch.nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
             torch.nn.ReLU(),
-            # 32×84×84
-            torch.nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            # 32×20×20
+            torch.nn.Conv2d(32, 64, kernel_size=4, stride=2),
             torch.nn.ReLU(),
-            # 64×42×42
-            torch.nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            # 64×9×9
+            torch.nn.Conv2d(64, 64, kernel_size=3, stride=1),
             torch.nn.ReLU(),
-            # 128×21×21
-            torch.nn.Conv2d(128, 64, kernel_size=3, stride=2, padding=1),
-            torch.nn.ReLU(),
-            # 64×11×11
+            # 64×7×7
         )
         self.feature_net = torch.nn.Sequential(
             self.conv_net,
-            torch.nn.AdaptiveAvgPool2d((7, 7)),
             torch.nn.Flatten(start_dim=1),
             torch.nn.Linear(64 * 7 * 7, 512),
             torch.nn.ReLU(),
