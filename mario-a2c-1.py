@@ -15,10 +15,10 @@ FRAME_STACK = 4
 LEARNING_RATE = 5e-4
 TRAIN_EPISODES = 3000
 GRADIENT_CLIP = 1.0
-VALUE_LOSS_COEF = 1
+VALUE_LOSS_COEF = 0.5
 ADV_NORM_EPS = 1e-8
-ENTROPY_BETA_START = 0.001
-ENTROPY_BETA_END = 0.0001
+ENTROPY_BETA_START = 0.05
+ENTROPY_BETA_END = 0.01
 ENTROPY_BETA_DECAY = 0.999
 BATCH_SIZE = 512
 
@@ -27,6 +27,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def normalize_state(state):
+    # 下采样 210×160 → 84×84，减少计算量，去除无用信息
+    state = cv2.resize(state, (84, 84), interpolation=cv2.INTER_AREA)
     return (state.astype(np.float32) / 127.5) - 1.0
 
 
@@ -69,25 +71,25 @@ class ActorCriticNet(torch.nn.Module):
         # 输入通道数现在是 FRAME_STACK (4) 而不是 1
         in_channels = FRAME_STACK
         self.conv_net = torch.nn.Sequential(
-            # Input: 4×210×160 (堆叠4帧)
+            # Input: 4×84×84 (堆叠4帧, 下采样后)
             torch.nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
             torch.nn.ReLU(),
-            # 32×210×160
+            # 32×84×84
             torch.nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             torch.nn.ReLU(),
-            # 64×105×80
+            # 64×42×42
             torch.nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             torch.nn.ReLU(),
-            # 128×53×40
+            # 128×21×21
             torch.nn.Conv2d(128, 64, kernel_size=3, stride=2, padding=1),
             torch.nn.ReLU(),
-            # 64×27×20
+            # 64×11×11
         )
         self.feature_net = torch.nn.Sequential(
             self.conv_net,
-            torch.nn.AdaptiveAvgPool2d((9, 5)),
+            torch.nn.AdaptiveAvgPool2d((7, 7)),
             torch.nn.Flatten(start_dim=1),
-            torch.nn.Linear(64 * 9 * 5, 512),
+            torch.nn.Linear(64 * 7 * 7, 512),
             torch.nn.ReLU(),
         )
         self.value_net = torch.nn.Sequential(
@@ -307,7 +309,7 @@ def test(policy_net, episodes: int = 1):
 
 def export_onnx(policy_net, filename="mario-a2c-1.onnx"):
     policy_net.eval()
-    dummy_input = torch.randn(1, FRAME_STACK, 210, 160).to(device)  # [1, FRAME_STACK, H, W]
+    dummy_input = torch.randn(1, FRAME_STACK, 84, 84).to(device)  # [1, FRAME_STACK, 84, 84]
     torch.onnx.export(
         policy_net,
         (dummy_input,),
