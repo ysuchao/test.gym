@@ -20,7 +20,7 @@ ADV_NORM_EPS = 1e-8
 ENTROPY_BETA_START = 0.05
 ENTROPY_BETA_END = 0.01
 ENTROPY_BETA_DECAY = 0.999
-BATCH_SIZE = 512
+BATCH_SIZE = 1024
 
 # RND (Random Network Distillation) 超参数
 # ==========================================
@@ -66,13 +66,13 @@ class FrameStacker:
 
 class RunningMeanStd:
     """Welford 在线算法，追踪 mean 和 variance
-    
+
     用于归一化 RND 的 intrinsic reward：
     - RND 的预测误差（prediction error）的绝对值会随训练变化
     - 训练初期误差大（一切都新奇），后期误差小（大部分都见过）
     - 不归一化的话，intrinsic reward 的 scale 不稳定，GAE 计算会出问题
     - 用 running mean/std 归一化后，intrinsic reward 始终在合理范围内
-    
+
     Welford 算法优势：
     - 数值稳定（不会因大量累加产生浮点误差）
     - O(1) 空间和时间（不需要存历史数据）
@@ -86,7 +86,7 @@ class RunningMeanStd:
 
     def update(self, x):
         """用一个 batch 的数据增量更新 mean 和 var
-        
+
         Args:
             x: numpy array，一个 batch 的 intrinsic reward 值
         """
@@ -97,7 +97,7 @@ class RunningMeanStd:
 
     def _update_from_moments(self, batch_mean, batch_var, batch_count):
         """并行 Welford 合并公式
-        
+
         将两组统计量（已有的 + 新 batch 的）合并为一组：
         - 新 mean = 加权平均
         - 新 var = 合并方差公式（考虑两组 mean 的差异）
@@ -182,17 +182,17 @@ class ActorCriticNet(torch.nn.Module):
 
 class RNDModel(torch.nn.Module):
     """Random Network Distillation (RND) — 好奇心驱动探索
-    
+
     核心思想：
     - target 网络：随机初始化后永远冻结，对同一个输入永远输出相同的随机特征
     - predictor 网络：可训练，尝试模仿 target 的输出
     - prediction error = intrinsic reward（内在奖励）
-    
+
     为什么有效？
     - 见过很多次的状态 → predictor 学会了预测 → error 低 → reward 低（"无聊"）
     - 从未见过的状态 → predictor 还没学会 → error 高 → reward 高（"好奇！"）
     - 这样 agent 被鼓励去探索新状态，而不是反复走老路
-    
+
     为什么用单帧而不是堆叠帧？
     - RND 判断的是"这个画面是否新奇"，不需要运动信息
     - 用单帧可以减少参数量，加快训练
@@ -238,10 +238,10 @@ class RNDModel(torch.nn.Module):
 
     def forward(self, obs):
         """计算 target 和 predictor 的输出
-        
+
         Args:
             obs: [B, 1, 84, 84] 单帧灰度图（归一化后）
-            
+
         Returns:
             target_features: [B, RND_OUTPUT_DIM] target 网络的输出（固定不变）
             predictor_features: [B, RND_OUTPUT_DIM] predictor 的预测
@@ -252,10 +252,10 @@ class RNDModel(torch.nn.Module):
 
     def compute_intrinsic_reward(self, obs):
         """计算 intrinsic reward = prediction error
-        
+
         Args:
             obs: [B, 1, 84, 84] 单帧灰度图
-            
+
         Returns:
             intrinsic_rewards: [B] 每个样本的内在奖励（MSE per sample）
         """
@@ -332,10 +332,10 @@ class Agent:
 
     def compute_intrinsic_reward(self, next_state):
         """用 RND 计算当前状态的 intrinsic reward
-        
+
         Args:
             next_state: [FRAME_STACK, H, W] 堆叠帧
-            
+
         Returns:
             float: 归一化后的 intrinsic reward
         """
@@ -361,13 +361,13 @@ class Agent:
             return
 
         log_probs = torch.cat(self.log_probs)                      # [B]
-        values = torch.cat(self.values).squeeze(-1)                 # [B]
-        intrinsic_values = torch.cat(self.intrinsic_values).squeeze(-1)  # [B]
+        values = torch.cat(self.values).view(-1)                    # [B]
+        intrinsic_values = torch.cat(self.intrinsic_values).view(-1)  # [B]
         entropies = torch.cat(self.entropies)                       # [B]
-        rewards_ext = torch.cat(self.rewards_ext).squeeze(-1)       # [B]
-        rewards_int = torch.cat(self.rewards_int).squeeze(-1)       # [B]
+        rewards_ext = torch.cat(self.rewards_ext).view(-1)          # [B]
+        rewards_int = torch.cat(self.rewards_int).view(-1)          # [B]
         next_states = torch.stack(self.next_states)                 # [B, FRAME_STACK, H, W]
-        terminateds = torch.cat(self.terminateds).squeeze(-1)       # [B]
+        terminateds = torch.cat(self.terminateds).view(-1)          # [B]
 
         # ========== RND predictor 更新 ==========
         # 用 batch 中的 next_states 训练 predictor 网络
