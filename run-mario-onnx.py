@@ -1,78 +1,86 @@
+import torch
+import time
+import random
 import sys
-import ale_py
 import gymnasium as gym
 import numpy as np
-import onnxruntime as ort
 import cv2
-
+import onnxruntime as ort
+import gym_super_mario_bros
+from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
+from nes_py.wrappers import JoypadSpace
 from collections import deque
 
-
-# 必须和训练时一致
+GAME_NAME = 'SuperMarioBros-1-1-v1'
 FRAME_STACK = 4
-gym.register_envs(ale_py)
+MAX_EPISODE_STEPS = 10000
+
+np.set_printoptions(suppress=True)
+
+def preprocess_state(state):
+    # 裁掉左侧16列
+    state = state[:, 16:, :]
+    # 转为灰度图并缩放到80x80
+    gray = cv2.cvtColor(state, cv2.COLOR_RGB2GRAY)
+    resized = cv2.resize(gray, (80, 80), interpolation=cv2.INTER_AREA)
+    return resized.astype(np.float32) / 255.0
+
+class FrameStacker:
+    def __init__(self, k: int = FRAME_STACK):
+        self.k = k
+        self.frames = deque(maxlen=k)
+        self._stacked = np.zeros((k, 80, 80), dtype=np.float32)
+
+    def reset(self, frame):
+        for _ in range(self.k):
+            self.frames.append(frame)
+        return self._get_stacked()
+
+    def step(self, frame):
+        self.frames.append(frame)
+        return self._get_stacked()
+
+    def _get_stacked(self):
+        for i, f in enumerate(self.frames):
+            self._stacked[i] = f
+        return self._stacked
 
 
-def normalize_state(state: np.ndarray) -> np.ndarray:
-    # 下采样 210×160 → 84×84，与训练预处理一致
-    state = cv2.resize(state, (84, 84), interpolation=cv2.INTER_AREA)
-    return (state.astype(np.float32) / 127.5) - 1.0
+def run_onnx_model(model_path, num_episodes=10):
+    session = ort.InferenceSession(model_path)
+    input_name = session.get_inputs()[0].name
+    env = JoypadSpace(gym_super_mario_bros.make(GAME_NAME, max_episode_steps=MAX_EPISODE_STEPS), SIMPLE_MOVEMENT)
+    frame_stacker = FrameStacker(FRAME_STACK)
 
-
-def run_onnx_model(
-    model_path: str,
-    num_episodes: int = 5,
-    full_action_space: bool = False,  # 必须和训练一致（训练时 full_action_space=False）
-    frameskip: int = 4,
-    render: bool = True,
-) -> None:
-    session = ort.InferenceSession(model_path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-    input_name = next(iter(session.get_inputs())).name
-    output_names = [o.name for o in session.get_outputs()]
-
-    env = gym.make(
-        "ALE/MarioBros-v5",
-        full_action_space=full_action_space,
-        obs_type="grayscale",
-        frameskip=frameskip,
-        render_mode="human" if render else None,
-    )
-
-    # 用 deque 管理帧堆叠，与训练时 FrameStacker 逻辑一致
-    frames: deque[np.ndarray] = deque(maxlen=FRAME_STACK)
-
-    for ep in range(num_episodes):
-        state_raw, _ = env.reset()
-        state = normalize_state(np.asarray(state_raw))
-        # 重置时用同一帧填充（与训练一致）
-        frames.clear()
-        for _ in range(FRAME_STACK):
-            frames.append(state)
-
-        total_reward = 0.0
+    rewards = []
+    for i in range(num_episodes):
+        state, _ = env.reset()
+        state = frame_stacker.reset(preprocess_state(state))
+        total_reward = 0
         done = False
-        step_count = 0
+        steps = 0
+        action = 0
         while not done:
-            # [FRAME_STACK, 84, 84] → [1, FRAME_STACK, 84, 84]
-            input_data = np.expand_dims(np.stack(frames, axis=0).astype(np.float32), axis=0)
-            results = session.run(output_names, {input_name: input_data})
-            # results[1] 是 action logits（不是 probs，ONNX 导出的是 raw logits）
-            logits = np.squeeze(np.asarray(results[1]), axis=0)
-            probs = np.exp(logits - np.max(logits))
-            probs = probs / np.sum(probs)
-            action = int(np.argmax(probs))
-
-            # 打印每种 action 的概率
-            action_probs_str = " | ".join([f"A{a}:{p:.3f}" for a, p in enumerate(probs)])
-            print(f"step={step_count:4d} | {action_probs_str} | chose=A{action}")
-
-            state_raw, reward, terminated, truncated, _ = env.step(action)
+            infer = bool(steps % 1 == 0)
+            if infer:
+                input_data = state.astype(np.float32).reshape(1, FRAME_STACK, 80, 80)
+                outputs = session.run(None, {input_name: input_data})
+                action = torch.distributions.Categorical(logits=torch.tensor(outputs[-1])).sample().item()
+                # action = np.argmax(outputs[-1])
+                # action = random.randint(0, 6)
+            else:
+                action = 0
+            # print(f"step={steps}, action={action}")
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            env.render()
+            time.sleep(0.01)
+            state = frame_stacker.step(preprocess_state(next_state))
+            steps += 1
+            total_reward += reward
             done = terminated or truncated
-            total_reward += float(reward)
-            state = normalize_state(np.asarray(state_raw))
-            frames.append(state)  # deque(maxlen=FRAME_STACK) 自动丢弃最旧帧
-            step_count += 1
-        print(f"test.episode={ep}, reward={total_reward:.3f}, steps={step_count}")
+        rewards.append(total_reward)
+        print(f"test.episode={i}, steps={steps}, reward={total_reward}")
+    print(f"reward.mean={sum(rewards) / len(rewards):.3f}")
     env.close()
 
 
